@@ -1,160 +1,124 @@
 #!/bin/bash
-# Uploads one or more files to Cloudinary and prints their direct URLs to stdout.
-# All errors are printed to stderr.
+# Uploads one or more files to Cloudinary. For each success it prints one line to stdout:
+#   <kind><TAB><path as given><TAB><Share Link>
+# where kind is image, video or raw. Errors and notes go to stderr; exits non-zero if any file fails.
 # Requires CLOUDINARY_URL (cloudinary://<key>:<secret>@<cloud>) in the environment, ~/.zshrc or ~/.bashrc.
 
 set -uo pipefail
 
-MAX_FILE_BYTES=10485760  # 10 MB
+# shellcheck source=lib.sh
+. "$(dirname "$0")/lib.sh"
 
 if [ "$#" -eq 0 ]; then
   echo "Usage: $0 <file_path1> [file_path2 ...]" >&2
   exit 1
 fi
 
-# Resolve CLOUDINARY_URL from the environment, then ~/.zshrc, then ~/.bashrc.
-# Never source shell init files (avoids running nvm/rbenv/prompt code).
-_load_cloudinary_url() {
-  # Already set in environment
-  [ -n "${CLOUDINARY_URL:-}" ] && return 0
+cu_require_credentials || exit 1
 
-  # Targeted grep from shell rc files (no sourcing)
-  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc")
-  for rc in "${rc_files[@]}"; do
-    if [ -f "$rc" ]; then
-      local line
-      line=$(grep -v '^\s*#' "$rc" 2>/dev/null | grep -m1 'CLOUDINARY_URL=')
-      if [ -n "$line" ]; then
-        # Strip leading whitespace, export keyword and surrounding quotes
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line#export }"
-        line="${line#CLOUDINARY_URL=}"
-        line="${line%\"}"
-        line="${line#\"}"
-        line="${line%\'}"
-        line="${line#\'}"
-        CLOUDINARY_URL="$line"
-        [ -n "$CLOUDINARY_URL" ] && return 0
-      fi
-    fi
-  done
-
-  return 1
-}
-
-_load_cloudinary_url || true
-
-if [ -z "${CLOUDINARY_URL:-}" ]; then
-  echo "Error: CLOUDINARY_URL is not set. Set it in your environment, or add: export CLOUDINARY_URL=cloudinary://<key>:<secret>@<cloud> to ~/.zshrc or ~/.bashrc." >&2
-  exit 1
-fi
-
-# Validate scheme
-if [[ "$CLOUDINARY_URL" != cloudinary://* ]]; then
-  echo "Error: CLOUDINARY_URL must start with 'cloudinary://'. Got: ${CLOUDINARY_URL%%:*}://..." >&2
-  exit 1
-fi
-
-# Parse cloudinary://<API_KEY>:<API_SECRET>@<CLOUD_NAME>
-URL_WITHOUT_SCHEME="${CLOUDINARY_URL#cloudinary://}"
-API_KEY="${URL_WITHOUT_SCHEME%%:*}"
-SECRET_AND_CLOUD="${URL_WITHOUT_SCHEME#*:}"
-# Use shortest match from the right so secrets containing '@' are handled correctly
-CLOUD_NAME="${SECRET_AND_CLOUD##*@}"
-API_SECRET="${SECRET_AND_CLOUD%@*}"
-
-if [ -z "$API_KEY" ] || [ -z "$API_SECRET" ] || [ -z "$CLOUD_NAME" ]; then
-  echo "Error: Could not parse CLOUDINARY_URL. Expected format: cloudinary://<key>:<secret>@<cloud>" >&2
-  exit 1
-fi
-
-# Detect sha1 command
-if command -v sha1sum >/dev/null 2>&1; then
-  _sha1() { echo -n "$1" | sha1sum | awk '{print $1}'; }
-elif command -v shasum >/dev/null 2>&1; then
-  _sha1() { echo -n "$1" | shasum | awk '{print $1}'; }
-else
-  echo "Error: Neither sha1sum nor shasum is available." >&2
-  exit 1
-fi
-
-# Detect file size command
-_file_size() {
-  if stat -f%z "$1" 2>/dev/null; then return; fi   # macOS
-  stat -c%s "$1" 2>/dev/null                        # Linux
-}
-
-API_ENDPOINT="https://api.cloudinary.com/v1_1/${CLOUD_NAME}/auto/upload"
 FAILURE_COUNT=0
+RESTRICTED_LINKS=()
+
+_fail() {
+  echo "Error: $1" >&2
+  FAILURE_COUNT=$((FAILURE_COUNT + 1))
+}
+
+_file_size() {
+  stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null
+}
 
 for FILE_PATH in "$@"; do
   if [ ! -f "$FILE_PATH" ]; then
-    echo "Error: File '$FILE_PATH' does not exist. Skipping." >&2
-    FAILURE_COUNT=$((FAILURE_COUNT + 1))
+    _fail "'$FILE_PATH' does not exist or isn't a regular file. Skipping."
+    continue
+  fi
+  if [ ! -r "$FILE_PATH" ]; then
+    _fail "'$FILE_PATH' isn't readable. Skipping."
     continue
   fi
 
-  # File size guard
   FILE_SIZE=$(_file_size "$FILE_PATH")
-  if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$MAX_FILE_BYTES" ]; then
-    SIZE_MB=$(( FILE_SIZE / 1048576 ))
-    echo "Error: '$FILE_PATH' is ${SIZE_MB}MB, exceeding the 10MB limit. Skipping." >&2
-    FAILURE_COUNT=$((FAILURE_COUNT + 1))
+  if [ -z "$FILE_SIZE" ]; then
+    _fail "Couldn't read the size of '$FILE_PATH'. Skipping."
+    continue
+  fi
+  if [ "$FILE_SIZE" -gt "$CU_MAX_FILE_BYTES" ]; then
+    _fail "'$FILE_PATH' is $((FILE_SIZE / 1048576)) MB, over Cloudinary's 100 MB limit for a single upload. Skipping."
     continue
   fi
 
-  # Build public_id: YYMMDD_HHMMSS_<sanitised-basename-without-extension>
-  BASENAME=$(basename "$FILE_PATH")
-  RAW_NAME="${BASENAME%.*}"
-  SANITIZED=$(echo "$RAW_NAME" | sed -E 's/[^a-zA-Z0-9_\-]/-/g')
-  DATESTAMP=$(date +%y%m%d_%H%M%S)
-
-  if [ -z "$SANITIZED" ]; then
-    # Dot-prefixed files (e.g. .gitignore) produce an empty name after stripping extension
-    echo "Error: Cannot derive a public_id from '$FILE_PATH' (dot-prefixed filename with no stem). Skipping." >&2
-    FAILURE_COUNT=$((FAILURE_COUNT + 1))
+  FILENAME=$(basename "$FILE_PATH")
+  EXTENSION=$(cu_extension "$FILE_PATH")
+  KIND=$(cu_kind "$FILE_PATH")
+  NAME=$(cu_random_name)
+  if [ "${#NAME}" -ne "$CU_NAME_LENGTH" ]; then
+    _fail "Couldn't generate a random name for '$FILE_PATH'. Skipping."
     continue
   fi
-
-  PUBLIC_ID="${DATESTAMP}_${SANITIZED}"
+  PUBLIC_ID=$(cu_public_id "$KIND" "$NAME" "$EXTENSION")
   TIMESTAMP=$(date +%s)
 
-  # Cloudinary signature: parameters alphabetically sorted, then secret appended (no &)
-  STRING_TO_SIGN="public_id=${PUBLIC_ID}&timestamp=${TIMESTAMP}${API_SECRET}"
-  SIGNATURE=$(_sha1 "$STRING_TO_SIGN")
+  # Never overwrite: a Share Link has no version, so a reused name would change what an older link serves.
+  SIGNATURE=$(cu_sign "$CU_API_SECRET" \
+    "asset_folder=$CU_ASSET_FOLDER" \
+    "display_name=$FILENAME" \
+    "overwrite=false" \
+    "public_id=$PUBLIC_ID" \
+    "timestamp=$TIMESTAMP") || exit 1
 
-  # Perform the upload; capture curl exit code separately from response body
-  RESPONSE=$(curl -s --max-time 60 -X POST "$API_ENDPOINT" \
-    -F "file=@${FILE_PATH}" \
-    -F "api_key=${API_KEY}" \
-    -F "public_id=${PUBLIC_ID}" \
-    -F "timestamp=${TIMESTAMP}" \
-    -F "signature=${SIGNATURE}" 2>&1)
+  # Quote the path for curl's -F syntax, so `;` or `,` in a filename isn't read as a field option.
+  QUOTED_PATH="${FILE_PATH//\\/\\\\}"
+  QUOTED_PATH="${QUOTED_PATH//\"/\\\"}"
+
+  # --speed-time aborts a stalled upload without capping a slow but healthy one.
+  RESPONSE=$(curl -sS --connect-timeout 20 --speed-limit 1 --speed-time 60 \
+    -X POST "https://api.cloudinary.com/v1_1/${CU_CLOUD_NAME}/${KIND}/upload" \
+    -F "file=@\"${QUOTED_PATH}\"" \
+    --form-string "api_key=${CU_API_KEY}" \
+    --form-string "asset_folder=${CU_ASSET_FOLDER}" \
+    --form-string "display_name=${FILENAME}" \
+    --form-string "overwrite=false" \
+    --form-string "public_id=${PUBLIC_ID}" \
+    --form-string "timestamp=${TIMESTAMP}" \
+    --form-string "signature=${SIGNATURE}" \
+    -w $'\n%{http_code}')
   CURL_EXIT=$?
+  if [ "$CURL_EXIT" -ne 0 ]; then
+    _fail "Network error uploading '$FILE_PATH' (curl exit $CURL_EXIT)."
+    continue
+  fi
+  STATUS="${RESPONSE##*$'\n'}"
+  BODY="${RESPONSE%$'\n'*}"
 
-  if [ $CURL_EXIT -ne 0 ]; then
-    echo "Error: Network/connection error uploading '$FILE_PATH' (curl exit $CURL_EXIT)." >&2
-    FAILURE_COUNT=$((FAILURE_COUNT + 1))
+  if [ "$STATUS" != 200 ]; then
+    MESSAGE=$(cu_json_get "$BODY" error.message)
+    _fail "Upload failed for '$FILE_PATH': ${MESSAGE:-unexpected response} (HTTP $STATUS)"
+    continue
+  fi
+  # With overwrite=false, a taken name still answers 200, describing the *old* file.
+  if [ "$(cu_json_get "$BODY" existing)" = true ]; then
+    _fail "Upload failed for '$FILE_PATH': the name $PUBLIC_ID is already taken. Try again."
     continue
   fi
 
-  # Parse secure_url from response (jq preferred, python3 fallback, grep last resort)
-  SECURE_URL=""
-  if command -v jq >/dev/null 2>&1; then
-    SECURE_URL=$(echo "$RESPONSE" | jq -r '.secure_url // empty' 2>/dev/null)
-  elif command -v python3 >/dev/null 2>&1; then
-    SECURE_URL=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('secure_url',''))" 2>/dev/null)
-  else
-    SECURE_URL=$(echo "$RESPONSE" | grep -o '"secure_url" *: *"[^"]*"' | sed 's/.*: *"\(.*\)"/\1/')
+  STORED_ID=$(cu_json_get "$BODY" public_id)
+  FORMAT=$(cu_json_get "$BODY" format)
+  if [ -z "$STORED_ID" ] || { [ "$KIND" != raw ] && [ -z "$FORMAT" ]; }; then
+    _fail "Upload of '$FILE_PATH' answered without a public_id or format. Response: $BODY"
+    continue
   fi
 
-  if [ -z "$SECURE_URL" ]; then
-    echo "Error: Upload failed for '$FILE_PATH'. Response: $RESPONSE" >&2
-    FAILURE_COUNT=$((FAILURE_COUNT + 1))
-  else
-    echo "$SECURE_URL"
+  LINK=$(cu_share_link "$CU_CLOUD_NAME" "$KIND" "$STORED_ID" "$FORMAT")
+  printf '%s\t%s\t%s\n' "$KIND" "$FILE_PATH" "$LINK"
+  if cu_delivery_restricted "$FILE_PATH"; then
+    RESTRICTED_LINKS+=("$LINK")
   fi
 done
+
+if [ "${#RESTRICTED_LINKS[@]}" -gt 0 ]; then
+  echo "Note: Cloudinary's Free plan blocks PDF and archive links with HTTP 401 until \"Allow delivery of PDF and ZIP files\" is turned on in Settings → Security (https://console.cloudinary.com/app/settings/security). Affected: ${RESTRICTED_LINKS[*]}" >&2
+fi
 
 [ "$FAILURE_COUNT" -gt 0 ] && exit 1
 exit 0

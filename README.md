@@ -1,15 +1,16 @@
 # Cloudinary uploader skill for AI agents
 
 An [Agent Skill](https://agentskills.io) that lets your AI agent (Claude Code, Codex, Cursor and
-others) upload local screenshots, images, videos and files to Cloudinary and hand you back a public
-link: ready to drop into a GitHub issue, a doc or a chat message.
+others) upload local screenshots, images, videos and files to Cloudinary and hand you back a short public
+link, like `https://res.cloudinary.com/your-cloud/d/k3f9x2ab.png`: ready to drop into a GitHub issue, a
+doc or a chat message.
 
 It's a single bash script that signs and sends uploads with `curl`. No SDK, no dependencies to
 install, and no build step.
 
 ## What you need
 
-- **macOS or Linux** with `bash` and `curl` (both come preinstalled). `jq` or `python3` is used to
+- **macOS or Linux** with `bash`, `curl` and `file` (all come preinstalled). `jq` or `python3` is used to
   read Cloudinary's response when available, but neither is required.
 - **A Cloudinary account**; the free plan works
 - **An AI agent that supports skills**, such as Claude Code, Codex or Cursor
@@ -76,7 +77,8 @@ Or run it yourself. Where the skill lives depends on the agents you picked in st
 ~/.agents/skills/cloudinary-uploader/scripts/upload.sh /path/to/some-image.png
 ```
 
-You should see a `https://res.cloudinary.com/...` link. Open it to check the upload.
+You should see a line like `image  /path/to/some-image.png  https://res.cloudinary.com/...`. Open the
+link to check the upload.
 
 If you installed without `-g`, the same folders are inside your project instead of your home
 folder.
@@ -91,28 +93,57 @@ Talk to your agent normally. You don't need to mention the skill or the word "Cl
 
 Images come back as Markdown image embeds (`![](...)`), everything else as links.
 
+To remove something you uploaded by mistake, ask: *Delete https://res.cloudinary.com/.../d/k3f9x2ab.png*.
+A Delete is permanent, and the link stops working within minutes. The agent only Deletes when you ask.
+
 ## Troubleshooting
 
 | Problem | Fix |
 | --- | --- |
 | `CLOUDINARY_URL is not set` | Add the `export` line to `~/.zshrc` or `~/.bashrc` (step 3). Only those two files and the environment are checked; `~/.profile`, `~/.bash_profile` and `.env` files are not. |
-| `CLOUDINARY_URL must start with 'cloudinary://'` | The saved value is wrong, for example `CLOUDINARY_URL=` pasted twice. The line should read `export CLOUDINARY_URL=cloudinary://...` (step 3). |
+| `CLOUDINARY_URL from … isn't a Cloudinary URL` | The saved value is wrong, for example `CLOUDINARY_URL=` pasted twice. The line should read `export CLOUDINARY_URL=cloudinary://...` (step 3). If it's set more than once, the last line wins, and `~/.zshrc` wins over `~/.bashrc`. |
 | Still using an old value after changing it | A `CLOUDINARY_URL` environment variable takes priority over the files. Run `unset CLOUDINARY_URL` or restart your terminal and agent. |
 | `Invalid Signature` or `Invalid api_key` | The key or secret was mistyped or regenerated. Copy the URL again (step 2). |
-| `exceeding the 10MB limit` | The skill refuses files over 10 MB. Compress or trim the file first. |
+| `File size too large. Got … Maximum is …` | The file is over your Cloudinary plan's limit (on Free: 10 MB for images and other files, 100 MB for videos). Compress or trim it first. |
+| `over Cloudinary's 100 MB limit for a single upload` | The skill doesn't upload files over 100 MB on any plan. |
+| A PDF or ZIP link answers `401` | Free accounts block PDF and archive delivery. Turn on **Allow delivery of PDF and ZIP files** in [Settings → Security](https://console.cloudinary.com/app/settings/security). A link opened before the change can stay blocked for a while because of caching. |
+| `the name d/… is already taken` | A one-in-a-trillion clash with an existing upload. Run the upload again. |
+| A `.log` or `.txt` link downloads instead of showing | Cloudinary serves raw files as downloads. That's expected. |
 | `Permission denied` running `upload.sh` | Run `chmod +x` on the script, or call it with `bash upload.sh ...`. |
 
 ## How it works
 
-Each file is uploaded with a signed request to `api.cloudinary.com` under the name
-`YYMMDD_HHMMSS_<original-name>`, so uploads never overwrite each other. The script prints one URL
-per line and exits non-zero if any file fails.
+Each file is uploaded with a signed request to `api.cloudinary.com` under a random name such as
+`d/k3f9x2ab`, and the skill builds the short link itself. Your original filename never appears in the
+link; it's kept as the file's display name in the Cloudinary console. Uploads never overwrite each other,
+so a link always shows the file it was made for. Files land in a console folder named `clouddrop`, shared
+with the author's [CloudDrop](https://github.com/HurayraIIT/cloudinary-drop) menu bar app.
+
+The script prints one line per uploaded file, `<kind><TAB><path><TAB><link>`, and exits non-zero if any
+file fails.
 
 **Privacy:** your Cloudinary URL stays on your computer. The skill talks only to
 `api.cloudinary.com`, and only when asked to upload. Uploaded files are **public**: anyone with the
 link can open them.
 
-For agents and the curious: [SKILL.md](SKILL.md) is what the agent reads.
+For agents and the curious: [SKILL.md](SKILL.md) is what the agent reads, [GLOSSARY.md](GLOSSARY.md)
+defines the terms, and [docs/adr/](docs/adr/) records why things are the way they are.
+
+## What changed in 2.0
+
+- **Short, private links.** Links are about 50 characters, with a random name instead of the filename.
+  Uploads made with 1.x keep their old links.
+- **New output.** Each line is `<kind><TAB><path><TAB><link>` instead of a bare URL, so every link can
+  be matched to its file even when one in a batch fails.
+- **Larger videos.** The fixed 10 MB limit is gone; your Cloudinary plan's limits apply, up to 100 MB.
+- **Deleting.** `scripts/delete.sh` permanently Deletes uploads, when you ask.
+- **Fixes.** Two files with the same name uploaded in the same second no longer replace each other,
+  slow uploads aren't cut off after 60 seconds, and `CLOUDINARY_URL` is read from shell files the way
+  the shell reads it.
+
+## Development
+
+Run the offline tests with `tests/run.sh`. They never touch the network.
 
 ## License
 
